@@ -29,6 +29,7 @@ class FakeWebUI:
     def __init__(self):
         self.connections = [self.connection("weather"), self.connection("news")]
         self.access = True
+        self.error = None
         self.headers = {}
         self.connects = []
         self.clients = []
@@ -46,6 +47,8 @@ class FakeWebUI:
 
         async def connect_mcp_server(request, server_id, user, extra_params):
             self.connects.append((user.id, server_id))
+            if self.error:
+                raise self.error
             if self.connections[0]["auth_type"] == "oauth_2.1" and not self.headers.get("Authorization"):
                 raise PermissionError("Auth required")
             for connection in self.connections:
@@ -191,14 +194,68 @@ class TestMCPToolCache:
         assert self.webui.connects == [("u1", "weather"), ("u2", "weather"), ("u1", "news")]
 
     def test_entry_expires(self):
+        extra = self.extra(stale_seconds=0)
         with patch.object(cache_module.time, "time", return_value=1000):
-            self.call()
+            self.call(extra=extra)
         with patch.object(cache_module.time, "time", return_value=1000 + 14_399):
-            self.call()
+            self.call(extra=extra)
         with patch.object(cache_module.time, "time", return_value=1000 + 14_400):
-            result = self.call()
+            result = self.call(extra=extra)
         assert isinstance(result[0], FakeClient)
         assert len(self.webui.connects) == 2
+
+    def test_stale_entry_is_served_while_refreshing_in_background(self):
+        extra = self.extra()
+        stale_at = 1000 + 14_400 + 5
+
+        async def scenario():
+            with patch.object(cache_module.time, "time", return_value=1000):
+                await self.connect(self.webui.request, "weather", user(), extra)
+            self.webui.specs["weather"] = [{"name": "forecast", "parameters": {}}]
+            with patch.object(cache_module.time, "time", return_value=stale_at):
+                stale_client, stale_specs = await self.connect(self.webui.request, "weather", user(), extra)
+                await self.connect(self.webui.request, "weather", user(), extra)
+                assert isinstance(stale_client, cache_module.CachedMCPClient)
+                assert [spec["name"] for spec in stale_specs] == ["search"]
+                await asyncio.gather(*cache_module._refreshes(self.webui.request).values())
+                return await self.connect(self.webui.request, "weather", user(), extra)
+
+        client, specs = run(scenario())
+        assert isinstance(client, cache_module.CachedMCPClient)
+        assert [spec["name"] for spec in specs] == ["forecast"]
+        assert len(self.webui.connects) == 2
+        assert self.webui.clients[-1].disconnected == 1
+        assert cache_module._refreshes(self.webui.request) == {}
+
+    def test_failed_refresh_keeps_stale_entry_and_retries(self):
+        extra = self.extra()
+        stale_at = 1000 + 14_400 + 5
+
+        async def scenario():
+            with patch.object(cache_module.time, "time", return_value=1000):
+                await self.connect(self.webui.request, "weather", user(), extra)
+            self.webui.error = RuntimeError("down")
+            with patch.object(cache_module.time, "time", return_value=stale_at):
+                client, _ = await self.connect(self.webui.request, "weather", user(), extra)
+                await asyncio.gather(*cache_module._refreshes(self.webui.request).values())
+                assert cache_module._refreshes(self.webui.request) == {}
+                self.webui.error = None
+                await self.connect(self.webui.request, "weather", user(), extra)
+                await asyncio.gather(*cache_module._refreshes(self.webui.request).values())
+            return client
+
+        client = run(scenario())
+        assert isinstance(client, cache_module.CachedMCPClient)
+        assert len(self.webui.connects) == 3
+
+    def test_entry_past_stale_window_blocks_on_live_connection(self):
+        extra = self.extra(stale_seconds=100)
+        with patch.object(cache_module.time, "time", return_value=1000):
+            self.call(extra=extra)
+        with patch.object(cache_module.time, "time", return_value=1000 + 14_400 + 100):
+            result = self.call(extra=extra)
+        assert isinstance(result[0], FakeClient)
+        assert cache_module._refreshes(self.webui.request) == {}
 
     def test_connection_edit_invalidates_entry(self):
         self.call()

@@ -1,7 +1,7 @@
 """
 title: MCP Tool Cache
 description: Caches MCP tool lists per user so chats start without connecting to every enabled MCP server; connects only when a tool is called. Works with native Tool Search.
-version: 1.0.0
+version: 1.1.0
 required_open_webui_version: 0.13.0
 """
 
@@ -21,6 +21,7 @@ log = logging.getLogger(__name__)
 
 STATE_KEY = "_mcp_tool_cache_v1"
 REQUEST_KEY = "_mcp_tool_cache_request_v1"
+REFRESH_KEY = "_mcp_tool_cache_refresh_v1"
 PATCH_MARKER = "__mcp_tool_cache_patch__"
 
 
@@ -37,6 +38,15 @@ def _cache(request: Any) -> OrderedDict:
         cache = OrderedDict()
         setattr(state, STATE_KEY, cache)
     return cache
+
+
+def _refreshes(request: Any) -> dict:
+    state = request.app.state
+    refreshes = getattr(state, REFRESH_KEY, None)
+    if not isinstance(refreshes, dict):
+        refreshes = {}
+        setattr(state, REFRESH_KEY, refreshes)
+    return refreshes
 
 
 def _store(request: Any, key: tuple, client: Any, specs: list, settings: dict) -> None:
@@ -136,10 +146,26 @@ def _build_cached_connect(original, tools_module):
                 _store(request, key, result[0], result[1], settings)
             return result
 
+        async def refresh():
+            # Runs after the chat has its stale tool list; the connection is only used to read specs.
+            try:
+                result = await original(request, server_id, user, extra_params)
+                if result is not None:
+                    _store(request, key, result[0], result[1], settings)
+                    await result[0].disconnect()
+            except Exception:
+                log.warning("MCP Tool Cache: background refresh of '%s' failed.", server_id, exc_info=True)
+            finally:
+                _refreshes(request).pop(key, None)
+
         cache = _cache(request)
         entry = cache.get(key)
-        if entry is not None and entry["expires_at"] > time.time():
+        now = time.time()
+        if entry is not None and entry["expires_at"] + settings.get("stale_seconds", 0) > now:
             cache.move_to_end(key)
+            refreshes = _refreshes(request)
+            if entry["expires_at"] <= now and key not in refreshes:
+                refreshes[key] = asyncio.ensure_future(refresh())
             return CachedMCPClient(server_id, entry, connect_and_store), copy.deepcopy(entry["specs"])
         cache.pop(key, None)
         return await connect_and_store()
@@ -188,7 +214,15 @@ class Filter:
         cache_seconds: int = Field(
             default=14_400,
             ge=0,
-            description="Seconds to reuse a user's MCP tool list per server. 0 disables the cache.",
+            description="Seconds a user's MCP tool list per server is fresh. 0 disables the cache.",
+        )
+        stale_seconds: int = Field(
+            default=604_800,
+            ge=0,
+            description=(
+                "Seconds after a tool list stops being fresh during which it is still served instantly "
+                "while a background refresh updates it. After that, the next chat waits for a live connection."
+            ),
         )
         maximum_entries: int = Field(
             default=512,
@@ -204,6 +238,7 @@ class Filter:
         if isinstance(__metadata__, dict) and install():
             __metadata__[REQUEST_KEY] = {
                 "cache_seconds": self.valves.cache_seconds,
+                "stale_seconds": self.valves.stale_seconds,
                 "maximum_entries": self.valves.maximum_entries,
             }
         return body
