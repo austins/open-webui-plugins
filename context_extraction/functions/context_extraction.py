@@ -1,7 +1,7 @@
 """
 title: Context Extraction
 description: Compacts long chats without a model call. Turn off Open WebUI's built-in Context Compaction (Admin Settings) while this filter is active, or the two will conflict. When the estimated request passes a share of the model's context window (taken from this filter's settings, the model's num_ctx, or the context length the provider reports, minus room for the reply), large older tool results become short stubs and older tool pictures become notes, and only if that is not enough are older turns replaced by extracted notes listing the requests, touched files, commands, and latest steps. Stubs and note steps name the tool call's ref so Chat Recall can read it back. Cuts depend only on the chat history, so they move only when the threshold is crossed. Warns, or optionally stops, when a request still cannot fit the model's known window. Pair it with the Chat Recall tool so the model can look up details the notes leave out.
-version: 1.1.1
+version: 1.2.0
 required_open_webui_version: 0.13.0
 """
 
@@ -62,7 +62,7 @@ READ_PREFIX = "- read "
 
 PATH_KEYS = ("path", "file_path", "filepath", "filename", "file", "target_file")
 COMMAND_KEYS = ("command", "cmd", "script")
-TARGET_KEYS = ("query", "url", "q", "pattern", "name", "id")
+TARGET_KEYS = ("query", "url", "q", "pattern", "name", "id", "code")
 CHANGE_RE = re.compile(
     r"write|edit|creat|patch|replac|delet|remov|move|renam|append|insert|update|save|upload|mkdir|apply",
     re.IGNORECASE,
@@ -409,7 +409,7 @@ class Filter:
             description="Never let the request grow past this many tokens before compacting, however large the window. 0 means no cap.",
         )
         target_percent: int = Field(
-            default=60,
+            default=50,
             ge=10,
             le=95,
             description="Size to aim for after compacting, as a percentage of the threshold. Lower leaves more room before the next compaction.",

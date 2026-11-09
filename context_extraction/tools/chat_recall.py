@@ -1,7 +1,7 @@
 """
 title: Chat Recall
-description: Companion to the Context Extraction filter. Searches and reads the current chat's saved history, including tool calls and their results, so the model can recover details that Context Extraction removed from its context. Search ranks matches by their keywords in any language, and a tool call can be read in full by the ref that Context Extraction's stubs and notes name. Reads only the signed-in user's current chat. Named apart from Open WebUI's built-in search_chats and view_chat; turn off the built-in Chat History tool in the model's settings so the model uses this one instead.
-version: 1.1.0
+description: Companion to the Context Extraction filter. Searches and reads the current chat's history, including tool calls and their results from earlier replies and from the reply in progress, so the model can recover details that Context Extraction removed from its context. Search ranks matches by their keywords in any language, and a tool call can be read in full by the ref that Context Extraction's stubs and notes name. Reads only the signed-in user's current chat. Named apart from Open WebUI's built-in search_chats and view_chat; turn off the built-in Chat History tool in the model's settings so the model uses this one instead.
+version: 1.2.0
 required_open_webui_version: 0.13.0
 """
 
@@ -293,7 +293,26 @@ class Tools:
     def __init__(self):
         self.valves = self.Valves()
 
-    async def _load_branch(self, chat_id: Any, message_id: Any, user: Any) -> list[dict]:
+    async def _live_output(self, chat_id: Any, message_id: Any, request: Any) -> Optional[list]:
+        """Open WebUI saves a reply to the chat only when it finishes, but keeps its output so far in a response
+        stream, in Redis when it is configured and in this process otherwise."""
+        state = getattr(getattr(request, "app", None), "state", None)
+        try:
+            from open_webui.tasks import get_response_streams_by_chat_id
+
+            streams = await get_response_streams_by_chat_id(getattr(state, "redis", None), chat_id)
+        except Exception:
+            log.warning("Chat Recall could not read the reply in progress", exc_info=True)
+            return None
+        for stream in streams or []:
+            if stream.get("message_id") == message_id and isinstance(stream.get("output"), list):
+                return list(stream["output"])
+        return None
+
+    async def _load_branch(
+        self, chat_id: Any, message_id: Any, user: Any, request: Any = None
+    ) -> tuple[list[dict], bool]:
+        """Return the branch ending at the reply in progress, and whether its live output could be read."""
         user_id = user.get("id") if isinstance(user, dict) else getattr(user, "id", None)
         if not user_id:
             raise ValueError("The signed-in user is not available.")
@@ -314,16 +333,25 @@ class Tools:
         if not messages_map:
             messages_map = history.get("messages") or {}
 
-        start = message_id if message_id in messages_map else history.get("currentId")
-        return get_message_list(messages_map, start) if start else []
+        live = False
+        if message_id in messages_map:
+            output = await self._live_output(chat_id, message_id, request)
+            live = output is not None
+            if output:
+                messages_map = {**messages_map, message_id: {**messages_map[message_id], "output": output}}
 
-    async def _branch_or_error(self, chat_id: Any, message_id: Any, user: Any):
+        start = message_id if message_id in messages_map else history.get("currentId")
+        return (get_message_list(messages_map, start) if start else []), live
+
+    async def _branch_or_error(self, chat_id: Any, message_id: Any, user: Any, request: Any = None):
+        """Return the branch, whether the reply in progress was read, and an error to return instead."""
         try:
-            return await self._load_branch(chat_id, message_id, user), None
+            branch, live = await self._load_branch(chat_id, message_id, user, request)
+            return branch, live, None
         except Exception as error:
             if not isinstance(error, ValueError):
                 log.exception("Chat Recall could not load the chat")
-            return None, f"Error: {error}"
+            return None, False, f"Error: {error}"
 
     async def recall_search(
         self,
@@ -333,9 +361,10 @@ class Tools:
         __user__: Optional[dict] = None,
         __chat_id__: Optional[str] = None,
         __message_id__: Optional[str] = None,
+        __request__: Any = None,
     ) -> str:
         """
-        Search the current chat's full saved history, including tool calls and tool results, for details that are no longer in context, such as earlier messages or tool output that was compacted away. Returns message numbers and tool call refs to pass to recall_read.
+        Search the current chat's full history, including tool calls and tool results, for details that are no longer in context, such as earlier messages or tool output that was compacted away. Returns message numbers and tool call refs to pass to recall_read.
         :param query: Keywords, an exact phrase, or an identifier such as a file name or error code.
         :param match: "any" (default) ranks parts by how many of the keywords they contain and how closely; "all" returns only parts that contain every word, newest first.
         :param count: Maximum number of matches to return (default 5, at most 20).
@@ -344,7 +373,7 @@ class Tools:
         phrase = " ".join(fold(str(query or ""))[0].split())
         if not phrase:
             return "Error: Provide a phrase or keywords to search for."
-        branch, error = await self._branch_or_error(__chat_id__, __message_id__, __user__)
+        branch, _, error = await self._branch_or_error(__chat_id__, __message_id__, __user__, __request__)
         if error:
             return error
 
@@ -471,23 +500,24 @@ class Tools:
         __user__: Optional[dict] = None,
         __chat_id__: Optional[str] = None,
         __message_id__: Optional[str] = None,
+        __request__: Any = None,
     ) -> str:
         """
-        Read the current chat's saved history in full: whole messages by number, or one tool call's arguments and output by its ref. Use message numbers and refs from recall_search, or a ref named in a Context Extraction stub or note.
+        Read the current chat's history in full: whole messages by number, or one tool call's arguments and output by its ref. Use message numbers and refs from recall_search, or a ref named in a Context Extraction stub or note.
         :param message: Number of the first message to read; the chat's first message is 1. Leave at 0 when passing ref.
         :param count: Number of consecutive messages to read (default 1, at most 10).
         :param offset: Character offset to continue a long read from, as given at the end of a previous result.
         :param ref: A tool call ref, such as a call ID or a message-qualified ref like 12/call_abc, to read that call's arguments and output.
         :return: The messages or tool call as a transcript, with a continuation note when more text remains.
         """
-        branch, error = await self._branch_or_error(__chat_id__, __message_id__, __user__)
+        branch, live, error = await self._branch_or_error(__chat_id__, __message_id__, __user__, __request__)
         if error:
             return error
         offset = max(0, int(offset or 0))
 
         ref = _clean_ref(ref)
         if ref:
-            found = _find_call(branch, ref)
+            found = _find_call(branch, ref, live)
             if isinstance(found, str):
                 return found
             number, call_id = found
@@ -545,8 +575,9 @@ def _call_refs(branch: list[dict]) -> dict[tuple[int, str], str]:
     }
 
 
-def _find_call(branch: list[dict], ref: str):
-    """Find the message holding a tool call ref, or explain why it cannot be read."""
+def _find_call(branch: list[dict], ref: str, live: bool = False):
+    """Find the message holding a tool call ref, or explain why it cannot be read. live says whether the branch
+    includes the output of the reply in progress."""
     qualified = QUALIFIED_REF_RE.fullmatch(ref)
     if qualified:
         number, call_id = int(qualified.group(1)), qualified.group(2)
@@ -564,7 +595,9 @@ def _find_call(branch: list[dict], ref: str):
     if numbers:
         choices = ", ".join(f"{number}/{ref}" for number in numbers)
         return f"Error: {len(numbers)} tool calls in this chat have the ID {ref}. Pass one of these refs instead: {choices}."
-    return (
-        f'Error: No saved tool call in this chat has the ref "{ref}". Tool output from the reply in progress is '
-        "saved only when that reply finishes, so it cannot be read yet; otherwise look for the detail with recall_search."
+    where = (
+        f'No tool call in this chat, including the reply in progress, has the ref "{ref}".'
+        if live
+        else f'No saved tool call in this chat has the ref "{ref}", and the reply in progress could not be checked.'
     )
+    return f"Error: {where} Check the ref, or look for the detail with recall_search."

@@ -72,9 +72,15 @@ class TestChatRecall:
             "open_webui.models.chats": types.ModuleType("open_webui.models.chats"),
             "open_webui.utils": types.ModuleType("open_webui.utils"),
             "open_webui.utils.misc": types.ModuleType("open_webui.utils.misc"),
+            "open_webui.tasks": types.ModuleType("open_webui.tasks"),
         }
         modules["open_webui.models.chats"].Chats = self.chats
         modules["open_webui.utils.misc"].get_message_list = get_message_list
+
+        async def no_streams(redis, chat_id):
+            return []
+
+        modules["open_webui.tasks"].get_response_streams_by_chat_id = no_streams
         with patch.dict(sys.modules, modules):
             self.tools = recall.Tools()
             yield
@@ -188,10 +194,83 @@ class TestChatRecall:
         assert read("6/fc1").endswith("retry_limit: 9")
         assert "filler" in read("2/fc1")
 
-    def test_unknown_ref_explains_that_the_reply_in_progress_is_not_saved_yet(self):
-        error = self.read(ref="call_new")
-        assert error.startswith('Error: No saved tool call in this chat has the ref "call_new".')
-        assert "saved only when that reply finishes" in error
+    def test_unknown_ref_is_reported(self):
+        self.live_reply([{"chat_id": "chat-1", "message_id": "a2", "output": self.live_output()}])
+        assert self.run_live("recall_read", ref="call_new") == (
+            'Error: No tool call in this chat, including the reply in progress, has the ref "call_new". '
+            "Check the ref, or look for the detail with recall_search."
+        )
+
+    def test_unknown_ref_says_when_the_reply_in_progress_was_not_checked(self):
+        unchecked = (
+            'Error: No saved tool call in this chat has the ref "call_new", and the reply in progress could not be '
+            "checked. Check the ref, or look for the detail with recall_search."
+        )
+        other_reply = [{"chat_id": "chat-1", "message_id": "other", "output": self.live_output()}]
+        for streams in ([], other_reply, RuntimeError("redis down")):
+            self.live_reply(streams)
+            assert self.run_live("recall_read", ref="call_new") == unchecked
+
+    def live_reply(self, streams, request=None):
+        """Give a2 the output of a reply in progress, which Open WebUI has not saved to the chat yet."""
+        calls = []
+
+        async def get_response_streams_by_chat_id(redis, chat_id):
+            calls.append((redis, chat_id))
+            if isinstance(streams, Exception):
+                raise streams
+            return streams
+
+        sys.modules["open_webui.tasks"].get_response_streams_by_chat_id = get_response_streams_by_chat_id
+        return calls
+
+    def live_output(self, text="build id: 4242"):
+        return [
+            {"type": "function_call", "call_id": "live1", "name": "execute_code", "arguments": '{"code": "x"}'},
+            {"type": "function_call_output", "call_id": "live1", "output": [{"type": "input_text", "text": text}]},
+        ]
+
+    def run_live(self, method, *args, request=None, **kwargs):
+        return asyncio.run(
+            getattr(self.tools, method)(
+                *args, __user__={"id": "user-1"}, __chat_id__="chat-1", __message_id__="a2", __request__=request, **kwargs
+            )
+        )
+
+    def test_reads_and_searches_the_reply_in_progress_without_redis(self):
+        calls = self.live_reply([{"chat_id": "chat-1", "message_id": "a2", "output": self.live_output()}])
+        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(redis=None)))
+        saved = self.chats.messages["a2"]
+
+        assert self.run_live("recall_read", ref="live1", request=request).endswith("[tool result: execute_code]\nbuild id: 4242")
+        result = json.loads(self.run_live("recall_search", "4242", request=request))
+        assert (result["results"][0]["message"], result["results"][0]["ref"]) == (4, "live1")
+        assert calls == [(None, "chat-1"), (None, "chat-1")]
+        assert self.run_live("recall_read", ref="fc1", request=request).startswith("## Message 2 (assistant), tool call fc1")
+        assert self.chats.messages["a2"] is saved and "output" not in saved
+
+    def test_passes_redis_to_open_webui_when_configured(self):
+        redis = object()
+        calls = self.live_reply([{"chat_id": "chat-1", "message_id": "a2", "output": self.live_output()}])
+        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(redis=redis)))
+
+        assert "build id: 4242" in self.run_live("recall_read", ref="live1", request=request)
+        assert calls == [(redis, "chat-1")]
+
+    def test_ignores_streams_of_other_replies_and_failures(self):
+        self.live_reply([{"chat_id": "chat-1", "message_id": "other", "output": self.live_output()}])
+        assert self.run_live("recall_read", ref="live1").startswith("Error: No saved tool call")
+
+        self.live_reply(RuntimeError("redis down"))
+        assert self.run_live("recall_read", ref="fc1").startswith("## Message 2 (assistant), tool call fc1")
+
+    def test_other_users_never_reach_the_reply_in_progress(self):
+        calls = self.live_reply([{"chat_id": "chat-1", "message_id": "a2", "output": self.live_output()}])
+        result = asyncio.run(
+            self.tools.recall_read(ref="live1", __user__={"id": "someone-else"}, __chat_id__="chat-1", __message_id__="a2")
+        )
+        assert result == "Error: The current chat was not found for this user."
+        assert calls == []
 
     def test_search_leaves_out_recall_calls_and_the_latest_user_message(self):
         last = self.append(

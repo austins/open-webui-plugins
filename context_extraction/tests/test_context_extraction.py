@@ -113,7 +113,8 @@ class TestContextExtraction:
         assert output[3]["role"] == "user"
         assert output[-1]["content"] == "answer 40"
         assert "- request 1" in output[1]["content"]
-        assert "- read src/f1_0.py" in output[1]["content"]
+        kept = int(output[3]["content"].split()[-1])
+        assert f"- read src/f{kept - 1}_0.py" in output[1]["content"]
         assert_tool_pairs(output)
 
     def test_prefix_stays_stable_until_threshold_is_crossed_again(self):
@@ -205,6 +206,8 @@ class TestContextExtraction:
                 assistant(calls=[(f"e{index}", "write_file", {"path": f"f{index % 30}.py"}), (f"s{index}", "run", {"command": f"make {index}"})]),
                 tool(f"e{index}", "ok"),
                 tool(f"s{index}", json.dumps({"error": "boom"}) if index % 5 == 0 else "done"),
+                assistant(calls=[(f"x{index}", "execute_code", {"code": f"print({index})\n" * (index % 4 + 1)})]),
+                tool(f"x{index}", "Error: crashed" if index % 3 == 0 else str(index)),
                 user(f"ask {index}"),
             ]
         extractor = ce.NoteExtractor(messages)
@@ -274,6 +277,22 @@ class TestContextExtraction:
         )
         assert "- read_file a.py (failed) [ref r1]" in notes
         assert "- assistant: Thinking.\n" in notes
+
+    def test_note_steps_show_the_code_a_call_runs(self):
+        code = "import json\n\nfor name in ['a.py', 'b.py']:\n    print(open(name).read()[:200])\n" + "#" * 300
+        notes = ce.extract_notes(
+            [
+                user("go"),
+                assistant(calls=[("x1", "execute_code", {"code": code}), ("q1", "search", {"query": "retry", "code": "x"})]),
+                tool("x1", "file body"),
+                tool("q1", "hits"),
+            ]
+        )
+        step = next(line for line in notes.splitlines() if line.startswith("- execute_code "))
+        assert step.startswith("- execute_code import json for name in ['a.py', 'b.py']: print(")
+        assert step.endswith("… [ref x1]")
+        assert "- search retry [ref q1]" in notes
+        assert f"[{ce.COMMANDS}]" not in notes and f"[{ce.FILES}]" not in notes
 
     def test_old_tool_pictures_become_notes_but_user_pictures_and_recent_ones_stay(self):
         def pictures(text, count=1):
