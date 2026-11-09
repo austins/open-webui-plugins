@@ -1,7 +1,7 @@
 """
 title: Ketch
 description: Searches the public web and extracts fresh page content with isolated Ketch subprocesses.
-version: 0.14.2
+version: 0.15.0
 required_open_webui_version: 0.11.3
 requirements: playwright==1.60.0
 """
@@ -48,7 +48,7 @@ MAX_CONCURRENT_DOCUMENT_EXTRACTIONS = 2
 MAX_DOCUMENT_HEADINGS = 64
 MAX_DOCUMENT_HEADING_CHARACTERS = 160
 TOOL_VERSION = "0.14.2"
-KETCH_VERSION = "0.16.2"
+KETCH_VERSION = "0.20.5"
 MAX_ARCHIVE_BYTES = 32 * 1024 * 1024
 MAX_BROWSER_ARCHIVE_BYTES = 192 * 1024 * 1024
 MAX_BROWSER_EXTRACTED_BYTES = 320 * 1024 * 1024
@@ -223,19 +223,19 @@ ERROR_CATEGORIES = {
 ARCHITECTURES = {
     "x86_64": {
         "release_arch": "x86_64",
-        "archive_sha256": "e84b7667212aeb8b7bd9a92bc2a25f1c31185e2c6fba5a4cd97c2ace5a504c82",
+        "archive_sha256": "969ce8c8d42b79a99aae1313cf818cfe538f8ba5be510a5a93db5c267a13a5b6",
     },
     "amd64": {
         "release_arch": "x86_64",
-        "archive_sha256": "e84b7667212aeb8b7bd9a92bc2a25f1c31185e2c6fba5a4cd97c2ace5a504c82",
+        "archive_sha256": "969ce8c8d42b79a99aae1313cf818cfe538f8ba5be510a5a93db5c267a13a5b6",
     },
     "aarch64": {
         "release_arch": "arm64",
-        "archive_sha256": "61e0a7ef16350534c586d7e2755a490333334fc40bdeac01c092bf77bf030b8c",
+        "archive_sha256": "391ad9e8fd5f125d4c6f2ce7988c634b72e4467324a31af49cb51b217fabc1e6",
     },
     "arm64": {
         "release_arch": "arm64",
-        "archive_sha256": "61e0a7ef16350534c586d7e2755a490333334fc40bdeac01c092bf77bf030b8c",
+        "archive_sha256": "391ad9e8fd5f125d4c6f2ce7988c634b72e4467324a31af49cb51b217fabc1e6",
     },
 }
 CHROMIUM_LIBRARIES = {
@@ -263,15 +263,15 @@ CHROMIUM_LIBRARIES = {
     "libxshmfence.so.1": "libxshmfence1",
 }
 CHROMIUM_PACKAGES = tuple(dict.fromkeys(CHROMIUM_LIBRARIES.values()))
-CHROME_FOR_TESTING_VERSION = "154.0.8037.57"
+CHROME_FOR_TESTING_VERSION = "157.0.8103.38"
 CHROME_FOR_TESTING_PLATFORM = "linux64"
 CHROME_FOR_TESTING_ARCHITECTURES = frozenset({"x86_64", "amd64"})
 CHROME_FOR_TESTING_URL = (
     "https://storage.googleapis.com/chrome-for-testing-public/"
-    "154.0.8037.57/linux64/chrome-headless-shell-linux64.zip"
+    "157.0.8103.38/linux64/chrome-headless-shell-linux64.zip"
 )
 CHROME_FOR_TESTING_SHA256 = (
-    "5a6979d0ab7cf952ea575d35164e7bdce4872b2ced8f8a215c8f8e8eda00ee09"
+    "deafffa74660b34853a4119c361fd427ac8c9fcb62db51ddb8a797cd83a4ba2d"
 )
 BROWSER_SANDBOX_CACHE = {"auto_without_no_sandbox": None}
 SANDBOX_ERROR_MARKERS = (
@@ -425,20 +425,13 @@ def _write_json_atomic(path: Path, value: dict) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
-def _safe_install_root(raw_path: str) -> Path:
-    data_root = Path("/app/backend/data").resolve()
-    candidate = Path(raw_path).resolve()
-    try:
-        candidate.relative_to(data_root)
-    except ValueError as error:
-        raise KetchError(
-            "installation_root must be inside /app/backend/data."
-        ) from error
-    if candidate == data_root:
-        raise KetchError(
-            "installation_root must be a dedicated subdirectory of /app/backend/data."
-        )
-    return candidate
+def _install_root(tool_id: Any) -> Path:
+    # The tool id becomes a path component; identifiers, as Open WebUI requires, never hold / \ or ..
+    if not isinstance(tool_id, str) or not tool_id.isidentifier():
+        raise KetchError("Open WebUI did not provide this tool's id.")
+    from open_webui.config import CACHE_DIR
+
+    return Path(CACHE_DIR).resolve() / "tools" / tool_id
 
 
 def _download_release(
@@ -1057,13 +1050,6 @@ class _RejectingProxy:
 
 class Tools:
     class Valves(BaseModel):
-        installation_root: str = Field(
-            default="/app/backend/data/ketch",
-            description=(
-                "Persistent Ketch runtime directory. It must be a dedicated "
-                "subdirectory of /app/backend/data."
-            ),
-        )
         search_backends: str = Field(
             default="exa,keenable,parallel",
             description=(
@@ -1230,6 +1216,8 @@ class Tools:
 
     def __init__(self):
         self.valves = self.Valves()
+        # Open WebUI keeps one instance per tool id, so every call sets the same value.
+        self._tool_id = None
 
     async def _emit_status(self, event_emitter, description: str, done: bool) -> None:
         if self.valves.show_status and event_emitter is not None:
@@ -1255,7 +1243,7 @@ class Tools:
 
     def _runtime_fingerprint(self) -> str:
         value = {
-            "root": self.valves.installation_root,
+            "root": self._tool_id,
             "version": KETCH_VERSION,
             "browser": self.valves.enable_browser,
             "dependencies": self.valves.install_system_dependencies,
@@ -3303,7 +3291,7 @@ class Tools:
         return environment
 
     def _temporary_parent(self, root: Optional[Path] = None) -> Path:
-        install_root = root or _safe_install_root(self.valves.installation_root)
+        install_root = root or _install_root(self._tool_id)
         parent = install_root / "browser-work"
         parent.mkdir(parents=True, exist_ok=True)
         os.chmod(parent, 0o711)
@@ -3404,9 +3392,8 @@ class Tools:
                     )
                 raise KetchError(
                     f"{label} requires directory {directory} to be searchable by "
-                    "the unprivileged browser uid. Configure the Ketch installation "
-                    "root elsewhere or ask an administrator to chmod o+x that "
-                    "directory."
+                    "the unprivileged browser uid. Ask an administrator to chmod "
+                    "o+x that directory."
                 )
 
     def _ensure_browser_wrapper(self, root: Path, browser_path: Path) -> Path:
@@ -3489,7 +3476,7 @@ class Tools:
             uid, gid = self._browser_uid_gid()
             for directory, _, _ in os.walk(home):
                 os.chown(directory, uid, gid)
-        root = _safe_install_root(self.valves.installation_root)
+        root = _install_root(self._tool_id)
         try:
             home.resolve().relative_to(root.resolve())
         except (OSError, ValueError):
@@ -3769,7 +3756,7 @@ class Tools:
                 raise KetchError(state["last_error"])
 
             try:
-                root = _safe_install_root(self.valves.installation_root)
+                root = _install_root(self._tool_id)
                 root.mkdir(parents=True, exist_ok=True)
                 if not os.access(root, os.W_OK | os.X_OK):
                     raise KetchError(f"The Open WebUI process cannot write to {root}.")
@@ -4764,6 +4751,7 @@ class Tools:
         __user__: Any = None,
         __metadata__: Optional[dict] = None,
         __event_emitter__=None,
+        __id__: Optional[str] = None,
     ) -> str:
         """
         DIRECT OPEN WEBUI TOOL: call ketch_search by name. Never route it
@@ -4787,6 +4775,7 @@ class Tools:
         :param limit: Number of ranked results, from 1 to the configured maximum.
         :return: JSON containing federated Ketch search results or an explicit error.
         """
+        self._tool_id = __id__
         if __request__ is None:
             return _json_error(
                 "request_context",
@@ -4984,7 +4973,7 @@ class Tools:
             scrape_root = (
                 runtime.get("root")
                 if isinstance(runtime.get("root"), Path)
-                else _safe_install_root(self.valves.installation_root)
+                else _install_root(self._tool_id)
             )
             with tempfile.TemporaryDirectory(
                 prefix="open-webui-ketch-scrape-",
@@ -5364,6 +5353,7 @@ class Tools:
         __user__: Any = None,
         __metadata__: Optional[dict] = None,
         __event_emitter__=None,
+        __id__: Optional[str] = None,
     ) -> str:
         """
         DIRECT OPEN WEBUI TOOL: call ketch_scrape by name. Never route it
@@ -5406,6 +5396,7 @@ class Tools:
         :param document_mode: Opt into one bounded full extraction and message-scoped document map only for requested highlights, a summary, review, or section lookup on exactly one long page; never use it merely because a normal extract is truncated or for narrow multi-source research.
         :return: JSON containing extracted page content or an explicit error.
         """
+        self._tool_id = __id__
         if __request__ is None:
             return _json_error(
                 "request_context",
@@ -5567,6 +5558,7 @@ class Tools:
         __user__: Any = None,
         __metadata__: Optional[dict] = None,
         __event_emitter__=None,
+        __id__: Optional[str] = None,
     ) -> str:
         """
         DIRECT OPEN WEBUI TOOL: call ketch_scrape_continue by name. Never route
@@ -5591,6 +5583,7 @@ class Tools:
         :param continuation_ids: One to three opaque continuation identifiers returned by Ketch; combine independent pending identifiers when useful.
         :return: JSON containing subsequent page extracts or explicit per-identifier errors.
         """
+        self._tool_id = __id__
         if __request__ is None:
             return _json_error(
                 "request_context",

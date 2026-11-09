@@ -62,3 +62,20 @@ class TestForceBrowserRepeat:
         _, error, eligible, _ = await self.reserve(True)
         assert error is None
         assert eligible == [URL]
+
+
+class TestInstallRoot:
+    def test_uses_the_tools_cache_folder(self, tmp_path, monkeypatch):
+        config = types.ModuleType("open_webui.config")
+        config.CACHE_DIR = tmp_path / "cache"
+        monkeypatch.setitem(sys.modules, "open_webui", types.ModuleType("open_webui"))
+        monkeypatch.setitem(sys.modules, "open_webui.config", config)
+        assert ketch._install_root("ketch") == (tmp_path / "cache" / "tools" / "ketch").resolve()
+
+    def test_rejects_ids_that_are_not_plain_identifiers(self):
+        for tool_id in (None, "", "../escape", "a/b", "a.b"):
+            try:
+                ketch._install_root(tool_id)
+            except ketch.KetchError:
+                continue
+            raise AssertionError(f"{tool_id!r} was accepted")
