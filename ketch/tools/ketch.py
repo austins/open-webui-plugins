@@ -1,7 +1,7 @@
 """
 title: Ketch
 description: Searches the public web and extracts fresh page content with isolated Ketch subprocesses.
-version: 0.15.0
+version: 0.15.1
 required_open_webui_version: 0.11.3
 requirements: playwright==1.60.0
 """
@@ -4707,7 +4707,7 @@ class Tools:
     ) -> str:
         """
         DIRECT OPEN WEBUI TOOL: call ketch_search by name. Never route it
-        through execute_tool or search for it with search_tools.
+        through call_tool or search for it with search_tools.
 
         Search the current public web for candidate sources. Results contain
         titles, URLs, and discovery snippets, not verified page evidence.
@@ -5309,7 +5309,7 @@ class Tools:
     ) -> str:
         """
         DIRECT OPEN WEBUI TOOL: call ketch_scrape by name. Never route it
-        through execute_tool or search for it with search_tools. Continue a
+        through call_tool or search for it with search_tools. Continue a
         partial whole-page task with the directly available
         ketch_scrape_continue function.
 
@@ -5514,7 +5514,7 @@ class Tools:
     ) -> str:
         """
         DIRECT OPEN WEBUI TOOL: call ketch_scrape_continue by name. Never route
-        it through execute_tool or search for it with search_tools.
+        it through call_tool or search for it with search_tools.
 
         Continue partial Ketch page extracts using one to three exact opaque
         identifiers from the most recent result. Pass identifiers unchanged;
