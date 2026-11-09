@@ -1,5 +1,7 @@
 import asyncio
+import os
 import sys
+import threading
 import types
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -62,6 +64,7 @@ class FakeWebUI:
         self.original = connect_mcp_server
         self.tools = types.ModuleType("open_webui.utils.tools")
         self.tools.ENABLE_TOOL_SERVERS = True
+        self.tools.ENABLE_FORWARD_USER_INFO_HEADERS = False
         self.tools.Config = SimpleNamespace(get=get_config)
         self.tools.has_connection_access = has_connection_access
         self.tools.build_tool_server_headers = build_tool_server_headers
@@ -80,6 +83,10 @@ class FakeWebUI:
             "info": {"id": server_id},
             "config": {"enable": True},
         }
+
+    def per_user(self):
+        for connection in self.connections:
+            connection["auth_type"] = "session"
 
     def modules(self):
         return patch.dict(
@@ -187,11 +194,48 @@ class TestMCPToolCache:
         assert fresh[0]["parameters"]["properties"] == {}
 
     def test_cache_is_isolated_per_user_and_server(self):
+        self.webui.per_user()
         self.call(account=user("u1"))
         self.call(account=user("u2"))
         self.call(server_id="news")
         self.call(account=user("u2"))
         assert self.webui.connects == [("u1", "weather"), ("u2", "weather"), ("u1", "news")]
+
+    @pytest.mark.parametrize(
+        "change, shared",
+        [
+            ({}, True),
+            ({"auth_type": "none"}, True),
+            ({"auth_type": None}, False),
+            ({"headers": {"X-Team": "static"}}, True),
+            ({"headers": {"X-User": "{{USER_EMAIL}}"}}, False),
+            ({"auth_type": "session"}, False),
+            ({"auth_type": "system_oauth"}, False),
+            ({"auth_type": "oauth_2.1"}, False),
+            ({"auth_type": "oauth_2.1_static"}, False),
+            ({"forwarding": True}, False),
+            ({"forwarding": "missing"}, False),
+        ],
+    )
+    def test_only_user_independent_servers_share_an_entry(self, change, shared):
+        self.webui.headers = {"Authorization": "Bearer synthetic-token"}
+        change = dict(change)
+        forwarding = change.pop("forwarding", False)
+        if forwarding == "missing":
+            del self.webui.tools.ENABLE_FORWARD_USER_INFO_HEADERS
+        else:
+            self.webui.tools.ENABLE_FORWARD_USER_INFO_HEADERS = forwarding
+        self.webui.connections[0].update(change)
+        self.call(account=user("u1"))
+        self.call(account=user("u2"))
+        expected = [("u1", "weather")] if shared else [("u1", "weather"), ("u2", "weather")]
+        assert self.webui.connects == expected
+
+    def test_shared_entry_still_checks_each_users_access(self):
+        self.call(account=user("u1"))
+        self.webui.access = False
+        self.call(account=user("u2"))
+        assert self.webui.connects == [("u1", "weather"), ("u2", "weather")]
 
     def test_entry_expires(self):
         extra = self.extra(stale_seconds=0)
@@ -331,3 +375,245 @@ class TestMCPToolCache:
         self.call(server_id="news", extra=extra)
         self.call(extra=extra)
         assert len(self.webui.connects) == 3
+
+
+class TestPersistence:
+    @pytest.fixture(autouse=True)
+    def open_webui(self, tmp_path):
+        cache_module._pruned_directories.clear()
+        self.webui = FakeWebUI()
+        self.webui.connections[0]["headers"] = {"X-Api-Key": "synthetic-header-secret"}
+        self.config = types.ModuleType("open_webui.config")
+        self.config.CACHE_DIR = tmp_path / "cache"
+        self.env = types.ModuleType("open_webui.env")
+        self.env.WEBUI_SECRET_KEY = "synthetic-webui-secret"
+        self.directory = self.config.CACHE_DIR / "functions" / "mcp_tool_cache" / cache_module.STORAGE_FOLDER
+        with self.webui.modules(), patch.dict(
+            sys.modules, {"open_webui.config": self.config, "open_webui.env": self.env}
+        ):
+            self.filter = cache_module.Filter()
+            self.connect = self.webui.middleware.connect_mcp_server
+            yield
+
+    def extra(self, filter_id="mcp_tool_cache", **valves):
+        for name, value in valves.items():
+            setattr(self.filter.valves, name, value)
+        metadata = {"session_id": "s1"}
+        run(self.filter.inlet({"messages": []}, __metadata__=metadata, __id__=filter_id))
+        return {"__metadata__": metadata, "__event_call__": None}
+
+    def call(self, server_id="weather", account=None, extra=None):
+        return run(self.connect(self.webui.request, server_id, account or user(), extra or self.extra()))
+
+    def restart(self):
+        self.webui.request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+
+    def files(self):
+        return sorted(self.directory.glob("*.json")) if self.directory.exists() else []
+
+    def test_files_hold_no_secrets_or_ids_and_are_private(self):
+        self.webui.specs["weather"][0]["description"] = "Looks up weather."
+        self.call(account=user("user-123"))
+        [path] = self.files()
+        text = path.read_text()
+        for secret in ("synthetic-secret", "synthetic-header-secret", "synthetic-webui-secret", "weather.example"):
+            assert secret not in text
+        for identifier in ("user-123", "weather"):
+            assert identifier not in path.name
+        assert '"Looks up weather."' in text
+        assert path.stat().st_mode & 0o777 == 0o600
+        assert self.directory.stat().st_mode & 0o777 == 0o700
+        assert list(self.directory.glob("*.tmp")) == []
+
+    def test_restart_serves_from_disk_without_connecting(self):
+        _, first_specs = self.call()
+        self.restart()
+        client, specs = self.call()
+        assert isinstance(client, cache_module.CachedMCPClient)
+        assert specs == first_specs
+        assert client.instructions == "weather instructions"
+        assert len(self.webui.connects) == 1
+
+    def test_restart_keeps_users_and_connection_edits_apart(self):
+        self.webui.per_user()
+        self.call(account=user("u1"))
+        self.restart()
+        self.call(account=user("u2"))
+        self.webui.connections[0]["key"] = "synthetic-rotated"
+        self.call(account=user("u1"))
+        assert self.webui.connects == [("u1", "weather"), ("u2", "weather"), ("u1", "weather")]
+
+    def test_shared_server_keeps_one_file_for_all_users(self):
+        self.call(account=user("u1"))
+        self.restart()
+        self.call(account=user("u2"))
+        assert len(self.files()) == 1
+        assert self.webui.connects == [("u1", "weather")]
+
+    def test_rotated_secret_key_replaces_file(self):
+        self.call()
+        self.env.WEBUI_SECRET_KEY = "synthetic-other-secret"
+        self.restart()
+        assert isinstance(self.call()[0], FakeClient)
+        self.restart()
+        assert isinstance(self.call()[0], cache_module.CachedMCPClient)
+        assert len(self.webui.connects) == 2
+        assert len(self.files()) == 1
+
+    def test_connection_edit_overwrites_the_same_file(self):
+        self.call()
+        [path] = self.files()
+        self.webui.connections[0]["key"] = "synthetic-rotated"
+        self.restart()
+        assert isinstance(self.call()[0], FakeClient)
+        assert self.files() == [path]
+        self.restart()
+        assert isinstance(self.call()[0], cache_module.CachedMCPClient)
+        assert len(self.webui.connects) == 2
+
+    def test_first_request_in_each_worker_prunes_old_files(self):
+        self.call()
+        [path] = self.files()
+        os.utime(path, (0, 0))
+        cache_module._pruned_directories.clear()
+        self.extra()
+        assert not path.exists()
+
+    @pytest.mark.parametrize("content", ["not json", "[]", '{"specs": []}'])
+    def test_corrupt_file_is_discarded(self, content):
+        self.call()
+        [path] = self.files()
+        path.write_text(content)
+        self.restart()
+        assert isinstance(self.call()[0], FakeClient)
+
+    def test_symlinked_file_is_not_followed(self, tmp_path):
+        self.call()
+        [path] = self.files()
+        target = tmp_path / "outside.json"
+        target.write_text(path.read_text())
+        path.unlink()
+        path.symlink_to(target)
+        self.restart()
+        assert isinstance(self.call()[0], FakeClient)
+        assert target.exists()
+        assert not self.files()[0].is_symlink()
+
+    def test_no_secret_key_keeps_cache_in_memory(self):
+        self.env.WEBUI_SECRET_KEY = ""
+        self.call()
+        assert self.files() == []
+
+    @pytest.mark.parametrize("filter_id", ["../escape", "a/b", "a.b", "", None])
+    def test_unsafe_filter_id_keeps_cache_in_memory(self, filter_id):
+        self.call(extra=self.extra(filter_id=filter_id))
+        assert not self.config.CACHE_DIR.exists()
+
+    def test_non_ascii_filter_id_persists(self):
+        self.call(extra=self.extra(filter_id="café_cache"))
+        assert list((self.config.CACHE_DIR / "functions" / "café_cache" / cache_module.STORAGE_FOLDER).glob("*.json"))
+
+    def test_files_are_bounded_and_expired_files_pruned(self):
+        self.webui.per_user()
+        extra = self.extra(maximum_entries=1)
+        self.call(extra=extra)
+        self.call(server_id="news", extra=extra)
+        assert len(self.files()) == 1
+        extra = self.extra(maximum_entries=10, cache_seconds=10, stale_seconds=0)
+        self.call(account=user("u2"), extra=extra)
+        for path in self.files():
+            os.utime(path, (0, cache_module.time.time() - 60))
+        (self.directory / ".abandoned.tmp").write_text("")
+        os.utime(self.directory / ".abandoned.tmp", (0, 0))
+        self.call(account=user("u3"), extra=extra)
+        assert len(self.files()) == 1
+        assert list(self.directory.glob("*.tmp")) == []
+
+    def test_stale_memory_uses_fresher_list_from_another_worker(self):
+        extra = self.extra()
+        with patch.object(cache_module.time, "time", return_value=1000):
+            self.call(extra=extra)
+        other_worker = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+        self.webui.specs["weather"] = [{"name": "forecast", "parameters": {}}]
+        with patch.object(cache_module.time, "time", return_value=20_000):
+            run(self.connect(other_worker, "weather", user(), self.extra(stale_seconds=0)))
+        with patch.object(cache_module.time, "time", return_value=20_001):
+            client, specs = self.call(extra=extra)
+        assert isinstance(client, cache_module.CachedMCPClient)
+        assert [spec["name"] for spec in specs] == ["forecast"]
+        assert cache_module._refreshes(self.webui.request) == {}
+        assert len(self.webui.connects) == 2
+
+    def test_write_failure_keeps_chat_working(self):
+        self.config.CACHE_DIR.mkdir(parents=True)
+        (self.config.CACHE_DIR / "functions").write_text("not a folder")
+        assert isinstance(self.call()[0], FakeClient)
+        assert isinstance(self.call()[0], cache_module.CachedMCPClient)
+
+    def test_key_evicted_during_disk_read_is_still_served(self):
+        extra = self.extra()
+        with patch.object(cache_module.time, "time", return_value=1000):
+            self.call(extra=extra)
+        read = cache_module._read_entry
+
+        def evicting_read(*args):
+            cache_module._cache(self.webui.request).clear()
+            return read(*args)
+
+        with patch.object(cache_module.time, "time", return_value=20_000), patch.object(
+            cache_module, "_read_entry", evicting_read
+        ):
+            client, _ = self.call(extra=extra)
+        assert isinstance(client, cache_module.CachedMCPClient)
+
+    def test_connection_is_returned_without_waiting_for_disk_write(self):
+        started, release = threading.Event(), threading.Event()
+        write = cache_module._write_entry
+
+        def slow_write(*args):
+            started.set()
+            release.wait(5)
+            return write(*args)
+
+        extra = self.extra()
+
+        async def scenario():
+            with patch.object(cache_module, "_write_entry", slow_write):
+                result = await self.connect(self.webui.request, "weather", user(), extra)
+                assert self.files() == []
+                release.set()
+                await asyncio.gather(*cache_module._pending_writes)
+            return result
+
+        assert isinstance(run(scenario())[0], FakeClient)
+        assert len(self.files()) == 1
+
+    def test_older_write_does_not_replace_newer_file(self):
+        self.call()
+        key = next(iter(cache_module._cache(self.webui.request)))
+        newer = cache_module._cache(self.webui.request)[key]
+        older = {**newer, "stored_at": newer["stored_at"] - 1, "specs": [{"name": "removed"}]}
+        settings = self.extra()["__metadata__"][cache_module.REQUEST_KEY]
+        cache_module._write_entry(str(self.directory), key, older, settings)
+        assert cache_module._read_entry(str(self.directory), key) == newer
+
+    def test_disk_read_does_not_replace_newer_memory_entry(self):
+        extra = self.extra()
+        with patch.object(cache_module.time, "time", return_value=1000):
+            self.call(extra=extra)
+        read = cache_module._read_entry
+        cache = cache_module._cache(self.webui.request)
+        [key] = cache
+        newer = {**cache[key], "stored_at": 19_000, "expires_at": 40_000, "specs": [{"name": "forecast"}]}
+
+        def racing_read(*args):
+            stored = read(*args)
+            cache[key] = newer
+            return stored
+
+        with patch.object(cache_module.time, "time", return_value=20_000), patch.object(
+            cache_module, "_read_entry", racing_read
+        ):
+            _, specs = self.call(extra=extra)
+        assert [spec["name"] for spec in specs] == ["forecast"]
+        assert cache[key] is newer
