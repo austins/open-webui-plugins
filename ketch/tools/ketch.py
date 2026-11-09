@@ -47,7 +47,15 @@ MAX_DOCUMENT_CACHE_CHARACTERS_GLOBAL = 20_000_000
 MAX_CONCURRENT_DOCUMENT_EXTRACTIONS = 2
 MAX_DOCUMENT_HEADINGS = 64
 MAX_DOCUMENT_HEADING_CHARACTERS = 160
-TOOL_VERSION = "0.14.2"
+TOOL_VERSION = "0.15.0"
+MAX_CHUNK_CHARACTERS = 8_000
+MAX_PAGE_CHARACTERS = 600_000
+MAX_RESULT_CHARACTERS = 120_000
+MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
+MAX_BROWSER_RESOURCE_BYTES = 60 * 1024 * 1024
+MAX_SEARCH_SNIPPET_CHARACTERS = 500
+BOOTSTRAP_TIMEOUT_SECONDS = 300
+BOOTSTRAP_RETRY_SECONDS = 60
 KETCH_VERSION = "0.20.5"
 MAX_ARCHIVE_BYTES = 32 * 1024 * 1024
 MAX_BROWSER_ARCHIVE_BYTES = 192 * 1024 * 1024
@@ -1074,10 +1082,6 @@ class Tools:
                 "off always uses --no-sandbox."
             ),
         )
-        browser_jitless: bool = Field(
-            default=True,
-            description="Launch Chromium with --js-flags=--jitless.",
-        )
         browser_unprivileged_uid: int = Field(
             default=65534,
             ge=1,
@@ -1095,12 +1099,6 @@ class Tools:
             ge=1,
             le=20,
             description="Maximum web results allowed in one search.",
-        )
-        maximum_search_snippet_characters: int = Field(
-            default=500,
-            ge=100,
-            le=2_000,
-            description="Maximum snippet characters returned per search result.",
         )
         maximum_scrape_urls: int = Field(
             default=3,
@@ -1149,39 +1147,6 @@ class Tools:
                 "including invalid or unavailable identifiers."
             ),
         )
-        maximum_page_characters: int = Field(
-            default=600_000,
-            ge=1_000,
-            le=1_000_000,
-            description=(
-                "Maximum source Markdown characters extracted only when "
-                "opt-in document mode is requested."
-            ),
-        )
-        maximum_chunk_characters: int = Field(
-            default=8_000,
-            ge=1_000,
-            le=8_000,
-            description="Maximum Markdown characters returned per page in one call; never above 8000.",
-        )
-        maximum_result_characters: int = Field(
-            default=120_000,
-            ge=5_000,
-            le=1_000_000,
-            description="Maximum total stdout characters accepted from Ketch.",
-        )
-        maximum_download_bytes: int = Field(
-            default=20 * 1024 * 1024,
-            ge=1 * 1024 * 1024,
-            le=50 * 1024 * 1024,
-            description="Maximum bytes accepted for one page or browser resource.",
-        )
-        maximum_browser_resource_bytes: int = Field(
-            default=60 * 1024 * 1024,
-            ge=5 * 1024 * 1024,
-            le=250 * 1024 * 1024,
-            description="Maximum combined browser resource bytes accepted per page.",
-        )
         command_timeout_seconds: int = Field(
             default=90,
             ge=10,
@@ -1196,18 +1161,6 @@ class Tools:
                 "Every hop is still SSRF-validated. Redirects to another host "
                 "are returned to the model as a validated destination."
             ),
-        )
-        bootstrap_timeout_seconds: int = Field(
-            default=300,
-            ge=60,
-            le=900,
-            description="Maximum runtime for each dependency or browser setup command.",
-        )
-        bootstrap_retry_seconds: int = Field(
-            default=60,
-            ge=0,
-            le=3_600,
-            description="Delay before retrying a failed runtime bootstrap.",
         )
         show_status: bool = Field(
             default=True,
@@ -1337,7 +1290,7 @@ class Tools:
         if usage_key is None:
             raise KetchError("Document mode requires authenticated user-message scope.")
         user_id, message_key = usage_key
-        if len(markdown) > self.valves.maximum_page_characters:
+        if len(markdown) > MAX_PAGE_CHARACTERS:
             raise KetchError(
                 "Document extraction exceeded the configured page ceiling."
             )
@@ -2267,10 +2220,10 @@ class Tools:
                     and isinstance(url_signature, str)
                     and isinstance(start_char, int)
                     and not isinstance(start_char, bool)
-                    and 0 < start_char < self.valves.maximum_page_characters
+                    and 0 < start_char < MAX_PAGE_CHARACTERS
                     and isinstance(max_chars, int)
                     and not isinstance(max_chars, bool)
-                    and 1_000 <= max_chars <= self.valves.maximum_chunk_characters
+                    and 1_000 <= max_chars <= MAX_CHUNK_CHARACTERS
                     and isinstance(force_browser, bool)
                     and (
                         document_id is None
@@ -3174,7 +3127,7 @@ class Tools:
         update = await self._run_process(
             [apt_get, "update"],
             environment=environment,
-            timeout_seconds=self.valves.bootstrap_timeout_seconds,
+            timeout_seconds=BOOTSTRAP_TIMEOUT_SECONDS,
         )
         if update["exit_code"] != 0:
             raise KetchError(
@@ -3189,7 +3142,7 @@ class Tools:
                 *CHROMIUM_PACKAGES,
             ],
             environment=environment,
-            timeout_seconds=self.valves.bootstrap_timeout_seconds,
+            timeout_seconds=BOOTSTRAP_TIMEOUT_SECONDS,
         )
         if install["exit_code"] != 0:
             raise KetchError(
@@ -3512,8 +3465,7 @@ class Tools:
             arguments.append(f"--user-data-dir={profile_dir}")
         if no_sandbox:
             arguments.append("--no-sandbox")
-        if self.valves.browser_jitless:
-            arguments.append("--js-flags=--jitless")
+        arguments.append("--js-flags=--jitless")
         return arguments
 
     def _cleanup_old_browser_installs(
@@ -3751,7 +3703,7 @@ class Tools:
                 state["last_error"]
                 and (state.get("failed_requirement") == "base" or browser_needed)
                 and time.monotonic() - state["failed_at"]
-                < self.valves.bootstrap_retry_seconds
+                < BOOTSTRAP_RETRY_SECONDS
             ):
                 raise KetchError(state["last_error"])
 
@@ -4010,10 +3962,10 @@ class Tools:
                                     if not chunk:
                                         continue
                                     total += len(chunk)
-                                    if total > self.valves.maximum_download_bytes:
+                                    if total > MAX_DOWNLOAD_BYTES:
                                         raise KetchError(
                                             f"Response from {current_url} exceeds the "
-                                            f"{self.valves.maximum_download_bytes}-byte "
+                                            f"{MAX_DOWNLOAD_BYTES}-byte "
                                             f"limit."
                                         )
                                     body.extend(chunk)
@@ -4154,7 +4106,7 @@ class Tools:
             raise _browser_dependency_error(error) from error
 
         resource_budget = _SharedByteBudget(
-            self.valves.maximum_browser_resource_bytes,
+            MAX_BROWSER_RESOURCE_BYTES,
             "Browser resources",
         )
         follow_same_host = self.valves.follow_same_host_redirects
@@ -4214,7 +4166,7 @@ class Tools:
                             )
                         body = await resource_budget.read_stream(
                             response.content,
-                            self.valves.maximum_download_bytes,
+                            MAX_DOWNLOAD_BYTES,
                             f"Browser resource {current_url}",
                         )
                         await route.fulfill(
@@ -4232,7 +4184,7 @@ class Tools:
                         navigation_failure = (response.status, current_url)
                     body = await resource_budget.read_stream(
                         response.content,
-                        self.valves.maximum_download_bytes,
+                        MAX_DOWNLOAD_BYTES,
                         f"Browser resource {current_url}",
                     )
                     await route.fulfill(
@@ -4305,7 +4257,7 @@ class Tools:
                             }
                             return html;
                         }""",
-                        max(1, self.valves.maximum_download_bytes // 3),
+                        max(1, MAX_DOWNLOAD_BYTES // 3),
                     )
                 except Exception as error:
                     raise KetchError(
@@ -4325,10 +4277,10 @@ class Tools:
                     raise KetchError(
                         "Rendered browser content is not valid Unicode and cannot be extracted."
                     ) from error
-                if len(rendered_bytes) > self.valves.maximum_download_bytes:
+                if len(rendered_bytes) > MAX_DOWNLOAD_BYTES:
                     raise KetchError(
                         f"Rendered DOM from {final_url} exceeds the "
-                        f"{self.valves.maximum_download_bytes}-byte limit."
+                        f"{MAX_DOWNLOAD_BYTES}-byte limit."
                     )
                 return {
                     "url": final_url,
@@ -4490,7 +4442,7 @@ class Tools:
         page_end = start_char + max_chars
         has_more = source_truncated or len(markdown) > page_end
         ceiling_reached = (
-            len(markdown) >= self.valves.maximum_page_characters and source_truncated
+            len(markdown) >= MAX_PAGE_CHARACTERS and source_truncated
         )
         chunk = markdown[start_char:page_end]
         if not chunk.strip():
@@ -4506,7 +4458,7 @@ class Tools:
             "returned_characters": len(chunk),
             "next_start_char": (
                 page_end
-                if has_more and page_end < self.valves.maximum_page_characters
+                if has_more and page_end < MAX_PAGE_CHARACTERS
                 else None
             ),
             "truncated": has_more or ceiling_reached,
@@ -4634,7 +4586,7 @@ class Tools:
                     continue
                 lines.append(line)
             snippet = " ".join(lines)
-            limit = self.valves.maximum_search_snippet_characters
+            limit = MAX_SEARCH_SNIPPET_CHARACTERS
             if len(snippet) > limit:
                 snippet = snippet[: max(0, limit - 3)].rstrip() + "..."
             item = {
@@ -4715,7 +4667,7 @@ class Tools:
                 [str(runtime["binary"]), *arguments],
                 environment=environment,
                 timeout_seconds=self.valves.command_timeout_seconds,
-                output_limit=self.valves.maximum_result_characters,
+                output_limit=MAX_RESULT_CHARACTERS,
             )
         await self._emit_status(event_emitter, f"Ketch {operation} finished", True)
 
@@ -5015,9 +4967,9 @@ class Tools:
                         document_id = spec.get("document_id")
                         document_mode = bool(spec.get("document_mode"))
                         extraction_limit = min(
-                            self.valves.maximum_page_characters,
+                            MAX_PAGE_CHARACTERS,
                             (
-                                self.valves.maximum_page_characters
+                                MAX_PAGE_CHARACTERS
                                 if document_mode
                                 else start_char + max_chars + 1
                             ),
@@ -5257,7 +5209,7 @@ class Tools:
                 json.dumps(response, ensure_ascii=False),
                 commit_ledger=False,
             )
-            if len(serialized) > self.valves.maximum_result_characters:
+            if len(serialized) > MAX_RESULT_CHARACTERS:
                 await self._rollback_continuation_claims(
                     request,
                     usage_key,
@@ -5481,13 +5433,13 @@ class Tools:
         if (
             isinstance(max_chars, bool)
             or not isinstance(max_chars, int)
-            or not 1_000 <= max_chars <= self.valves.maximum_chunk_characters
+            or not 1_000 <= max_chars <= MAX_CHUNK_CHARACTERS
         ):
             return await reject(
                 _json_error(
                     "validation",
                     f"max_chars must be between 1000 and "
-                    f"{self.valves.maximum_chunk_characters}.",
+                    f"{MAX_CHUNK_CHARACTERS}.",
                 )
             )
         if force_browser and not self.valves.enable_browser:
